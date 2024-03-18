@@ -712,48 +712,25 @@ class RolloutWorker:
         """
 
         episode = 0
-        if expert:
-            if not verbose:
-                while episode < nb_episodes:
-                    self.collect_train_episode(self.max_samples_per_episode)
-                    self.send_and_clear_buffer()
-                    self.ignore_actor_weights()
-                    episode += 1
-            else:
-                while episode < nb_episodes:
-                    print_with_timestamp("collecting expert episode")
-                    self.collect_train_episode(self.max_samples_per_episode)
-                    print_with_timestamp("copying buffer for sending")
-                    self.send_and_clear_buffer()
-                    self.ignore_actor_weights()
-                    episode += 1
-        elif not verbose:
-            if not test_episode_interval:
-                while episode < nb_episodes:
-                    self.collect_train_episode(self.max_samples_per_episode)
-                    self.send_and_clear_buffer()
-                    self.update_actor_weights(verbose=False)
-                    episode += 1
-            else:
-                while episode < nb_episodes:
-                    if episode % test_episode_interval == 0 and not self.crc_debug:
-                        self.run_episode(self.max_samples_per_episode, train=False)
-                    self.collect_train_episode(self.max_samples_per_episode)
-                    self.send_and_clear_buffer()
-                    self.update_actor_weights(verbose=False)
-                    episode += 1
-        else:
-            while episode < nb_episodes:
-                if test_episode_interval and episode % test_episode_interval == 0 and not self.crc_debug:
+        while episode < nb_episodes:
+            if not expert and test_episode_interval and episode % test_episode_interval == 0 and not self.crc_debug:
+                if verbose:
                     print_with_timestamp("running test episode")
-                    self.run_episode(self.max_samples_per_episode, train=False)
-                print_with_timestamp("collecting train episode")
-                self.collect_train_episode(self.max_samples_per_episode)
-                print_with_timestamp("copying buffer for sending")
+                self.run_episode(self.max_samples_per_episode, train=False)
+            if verbose:
+                print_with_timestamp("collecting episode")
+            self.collect_train_episode(self.max_samples_per_episode)
+            if not self.standalone:
+                if verbose:
+                    print_with_timestamp("copying buffer for sending")
                 self.send_and_clear_buffer()
-                print_with_timestamp("checking for new weights")
-                self.update_actor_weights(verbose=True)
-                episode += 1
+                if expert:
+                    self.ignore_actor_weights()
+                else:
+                    if verbose:
+                        print_with_timestamp("checking for new weights")
+                    self.update_actor_weights(verbose=verbose)
+            episode += 1
 
     def run_synchronous(self,
                         test_episode_interval=0,
@@ -922,7 +899,8 @@ class RolloutWorker:
         """
         Sends the buffered samples to the `Server`.
         """
-        self.__endpoint.produce(self.buffer, "trainers")
+        if self.__endpoint is not None:
+            self.__endpoint.produce(self.buffer, "trainers")
         self.buffer.clear()
 
     def update_actor_weights(self, verbose=True, blocking=False):
