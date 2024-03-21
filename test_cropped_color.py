@@ -63,6 +63,12 @@ from tmrl.training_offline import TrainingOffline
 import numpy as np
 import os
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.normal import Normal
+from math import floor
+import time
 
 # Now, let us look into the content of config.json:
 
@@ -71,6 +77,9 @@ import os
 # =====================================================================
 # You can change these parameters here directly (not recommended),
 # or you can change them in the TMRL config.json file (recommended).
+
+if cfg.TMRL_CONFIG["RUN_NAME"] != "test_cropped_color":
+    raise Exception("name should be test_cropped_color, not {}".format(cfg.TMRL_CONFIG["RUN_NAME"]))
 
 # Maximum number of training 'epochs':
 # (training is checkpointed at the end of each 'epoch', this is also when training metrics can be logged to wandb)
@@ -166,7 +175,7 @@ obs_preprocessor = cfg_obj.OBS_PREPROCESSOR
 env_cls = cfg_obj.ENV_CLS
 
 # Device used for inference on workers (change if you like but keep in mind that the competition evaluation is on CPU)
-device_worker = 'cpu'
+device_worker = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 # =====================================================================
@@ -177,6 +186,7 @@ device_worker = 'cpu'
 # Your environment configuration must be part of your submission,
 # e.g., the "ENV" entry of your config.json file.
 
+# add assertions here or just ignore config during development
 # Dimensions of the TrackMania window:
 window_width = cfg.WINDOW_WIDTH  # must be between 256 and 958
 window_height = cfg.WINDOW_HEIGHT  # must be between 128 and 488
@@ -245,13 +255,6 @@ LOG_STD_MIN = -20
 # TMRL readily provides a PyTorch-specific subclass of ActorModule:
 from tmrl.actor import TorchActorModule
 
-# Plus a couple useful imports:
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions.normal import Normal
-from math import floor
-
 
 # In the full version of the TrackMania 2020 environment, the
 # observation-space comprises a history of screenshots. Thus, we need
@@ -309,26 +312,23 @@ class VanillaCNN(nn.Module):
         super(VanillaCNN, self).__init__()
 
         self.q_net = q_net
+        self.img_archive = None
+        self.img_archive2 = None
 
         # Convolutional layers processing screenshots:
         in_channels = imgs_buf_len * (1 if img_grayscale else 3)
         self.h_out, self.w_out = img_height, img_width
-
-        # self.conv00 = nn.Conv2d(in_channels, 32, 4, stride=2)
-        # self.h_out, self.w_out = conv2d_out_dims(self.conv00, self.h_out, self.w_out)
-        # self.conv0 = nn.Conv2d(32, 32, 4, stride=2)
-        # self.h_out, self.w_out = conv2d_out_dims(self.conv0, self.h_out, self.w_out)
-        # self.conv1 = nn.Conv2d(32, 64, 4, stride=2)
-
-        self.conv1 = nn.Conv2d(in_channels, 64, 8, stride=2)
+        self.conv1 = nn.Conv2d(in_channels, 24, 9, stride=2)
         self.h_out, self.w_out = conv2d_out_dims(self.conv1, self.h_out, self.w_out)
-        self.conv2 = nn.Conv2d(64, 64, 4, stride=2)
+        self.conv2 = nn.Conv2d(24, 36, 7, stride=2)
         self.h_out, self.w_out = conv2d_out_dims(self.conv2, self.h_out, self.w_out)
-        self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
+        self.conv3 = nn.Conv2d(36, 48, 5, stride=1)
         self.h_out, self.w_out = conv2d_out_dims(self.conv3, self.h_out, self.w_out)
-        self.conv4 = nn.Conv2d(128, 128, 4, stride=2)
+        self.conv4 = nn.Conv2d(48, 60, 5, stride=1)
         self.h_out, self.w_out = conv2d_out_dims(self.conv4, self.h_out, self.w_out)
-        self.out_channels = self.conv4.out_channels
+        self.conv5 = nn.Conv2d(48, 60, 3, stride=1)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv5, self.h_out, self.w_out)
+        self.out_channels = self.conv5.out_channels
 
         # Dimensionality of the CNN output:
         self.flat_features = self.out_channels * self.h_out * self.w_out
@@ -371,26 +371,28 @@ class VanillaCNN(nn.Module):
         # and the default config outputs these as 64 x 64 greyscale,
         # we will stack these greyscale images along the channel dimension of our input tensor)
 
+        if img_grayscale:
+            raise Exception("grayscale should be set to false.")
 
+        images = torch.cat((images[:,:,:,:,0],images[:,:,:,:,1],images[:,:,:,:,2]), 1)
 
-        if not img_grayscale:
-            images = torch.cat((images[:,:,:,:,0],images[:,:,:,:,1],images[:,:,:,:,2]), 1)
+        if images.shape[1:] != (12, 164, 80):
+            raise Exception("Image shape should be (x, 4, 164, 80), not {}".format(images.shape))
 
         # trim out superfluous top and bottom sections
         images = images[:, :, img_crop_top:-img_crop_bottom, img_crop_sides:-img_crop_sides]  # origin is top left
 
-        # torch.set_printoptions(threshold=100000, linewidth=200, precision=2)
-        # np.set_printoptions(threshold=100000, linewidth=200, precision=2)
-        # print(images)
+        if images.shape[1:] != (12, 64, 64):
+            raise Exception("Image shape should be (x, 4, 64, 64), not {}".format(images.shape))
 
-        # x = F.relu(self.conv00(images))
-        # x = F.relu(self.conv0(x))
-        # x = F.relu(self.conv1(x))
+        # self.save_images(images)
+        # grab_data_and_img()
 
         x = F.relu(self.conv1(images))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
+        x = F.relu(self.conv5(x))
 
         # Now we will flatten our output feature map.
         # Let us double-check that our dimensions are what we expect them to be:
@@ -412,6 +414,49 @@ class VanillaCNN(nn.Module):
 
         # And this gives us the output of our deep neural network :)
         return x
+
+    def save_images(self, images):
+        if self.img_archive is None:
+            self.img_archive = np.array(images.cpu()[0])
+        else:
+            self.img_archive = np.append(self.img_archive, images.cpu()[0], axis=0)
+        if len(self.img_archive) >= 100:
+            np.save("img_archive/{}x{}-{}-{}-{}.npy".format(img_height, img_width, img_grayscale,
+                                                            time.strftime("%Y%m%d-%H%M%S"), self.img_archive.sum()),
+                    self.img_archive)
+            self.img_archive = None
+    def save_images2(self, images):
+        if self.img_archive2 is None:
+            self.img_archive2 = np.array(images.cpu()[0])
+        else:
+            self.img_archive2 = np.append(self.img_archive2, images.cpu()[0], axis=0)
+        if len(self.img_archive2) >= 100:
+            np.save("img_archive/{}x{}-{}-{}-{}.npy".format(img_height, img_width, img_grayscale,
+                                                            time.strftime("%Y%m%d-%H%M%S"), self.img_archive2.sum()),
+                    self.img_archive2)
+            self.img_archive2 = None
+
+import time
+import cv2
+from tmrl.custom.utils.window import WindowInterface
+
+def grab_data_and_img():
+    window_interface = WindowInterface("Trackmania")
+
+    img = window_interface.screenshot()[:, :, :3]  # BGR ordering
+    img = img[:, :, ::-1]  # reversed view for numpy RGB convention
+    np.save("img_archive/{},{},{}-{}-{}.npy".format(
+                img.shape[0], img.shape[1], img.shape[2],
+                time.strftime("%Y%m%d-%H%M%S"),
+                img.sum()),
+            img)
+
+    # if resize_to is not None:  # cv2.resize takes dim as (width, height)
+    #     img = cv2.resize(img, self.resize_to)
+    # if grayscale:
+    #     img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # else:
+    #     img = img[:, :, ::-1]  # reversed view for numpy RGB convention
 
 
 # We can now implement the TMRL ActorModule interface that we are supposed to submit for this competition.
@@ -898,7 +943,6 @@ if __name__ == "__main__":
                            standalone=args.test)
         rw.run()
     elif args.server:
-        import time
         serv = Server(port=server_port,
                       password=password,
                       security=security)

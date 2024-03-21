@@ -48,7 +48,7 @@ class RewardFunction:
 
         # self.traj = []
 
-    def compute_reward(self, pos):
+    def compute_reward(self, pos, speed):
         """
         Computes the current reward given the position pos
         Args:

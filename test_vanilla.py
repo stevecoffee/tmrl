@@ -63,6 +63,12 @@ from tmrl.training_offline import TrainingOffline
 import numpy as np
 import os
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions.normal import Normal
+from math import floor
+import time
 
 # Now, let us look into the content of config.json:
 
@@ -71,6 +77,9 @@ import os
 # =====================================================================
 # You can change these parameters here directly (not recommended),
 # or you can change them in the TMRL config.json file (recommended).
+
+if cfg.TMRL_CONFIG["RUN_NAME"] != "test_vanilla":
+    raise Exception("name should be test_vanilla, not {}".format(cfg.TMRL_CONFIG["RUN_NAME"]))
 
 # Maximum number of training 'epochs':
 # (training is checkpointed at the end of each 'epoch', this is also when training metrics can be logged to wandb)
@@ -166,7 +175,7 @@ obs_preprocessor = cfg_obj.OBS_PREPROCESSOR
 env_cls = cfg_obj.ENV_CLS
 
 # Device used for inference on workers (change if you like but keep in mind that the competition evaluation is on CPU)
-device_worker = 'cpu'
+device_worker = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
 # =====================================================================
@@ -177,6 +186,7 @@ device_worker = 'cpu'
 # Your environment configuration must be part of your submission,
 # e.g., the "ENV" entry of your config.json file.
 
+# add assertions here or just ignore config during development
 # Dimensions of the TrackMania window:
 window_width = cfg.WINDOW_WIDTH  # must be between 256 and 958
 window_height = cfg.WINDOW_HEIGHT  # must be between 128 and 488
@@ -184,13 +194,6 @@ window_height = cfg.WINDOW_HEIGHT  # must be between 128 and 488
 # Dimensions of the actual images in observations:
 img_width = cfg.IMG_WIDTH
 img_height = cfg.IMG_HEIGHT
-
-img_crop_top = int(cfg.IMG_CROP_TOP * img_height)  # pixels to crop off the top
-img_crop_bottom = int(cfg.IMG_CROP_BOTTOM * img_height)  # pixels to crop off the bottom
-img_crop_sides = int(cfg.IMG_CROP_SIDES * img_width)  # pixels to crop off the bottom
-
-img_height = img_height - img_crop_top - img_crop_bottom
-img_width = img_width - 2 * img_crop_sides
 
 # Whether you are using grayscale (default) or color images:
 # (Note: The tutorial will stop working if you use colors)
@@ -244,13 +247,6 @@ LOG_STD_MIN = -20
 # We will use PyTorch in this tutorial.
 # TMRL readily provides a PyTorch-specific subclass of ActorModule:
 from tmrl.actor import TorchActorModule
-
-# Plus a couple useful imports:
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.distributions.normal import Normal
-from math import floor
 
 
 # In the full version of the TrackMania 2020 environment, the
@@ -309,18 +305,12 @@ class VanillaCNN(nn.Module):
         super(VanillaCNN, self).__init__()
 
         self.q_net = q_net
+        self.img_archive = None
 
         # Convolutional layers processing screenshots:
-        in_channels = imgs_buf_len * (1 if img_grayscale else 3)
+        # The default config.json gives 4 grayscale images of 64 x 64 pixels
         self.h_out, self.w_out = img_height, img_width
-
-        # self.conv00 = nn.Conv2d(in_channels, 32, 4, stride=2)
-        # self.h_out, self.w_out = conv2d_out_dims(self.conv00, self.h_out, self.w_out)
-        # self.conv0 = nn.Conv2d(32, 32, 4, stride=2)
-        # self.h_out, self.w_out = conv2d_out_dims(self.conv0, self.h_out, self.w_out)
-        # self.conv1 = nn.Conv2d(32, 64, 4, stride=2)
-
-        self.conv1 = nn.Conv2d(in_channels, 64, 8, stride=2)
+        self.conv1 = nn.Conv2d(imgs_buf_len, 64, 8, stride=2)
         self.h_out, self.w_out = conv2d_out_dims(self.conv1, self.h_out, self.w_out)
         self.conv2 = nn.Conv2d(64, 64, 4, stride=2)
         self.h_out, self.w_out = conv2d_out_dims(self.conv2, self.h_out, self.w_out)
@@ -371,21 +361,10 @@ class VanillaCNN(nn.Module):
         # and the default config outputs these as 64 x 64 greyscale,
         # we will stack these greyscale images along the channel dimension of our input tensor)
 
+        if images.shape != (1, 4, 64, 64):
+            raise Exception("Image shape should be (1, 4, 64, 64)")
 
-
-        if not img_grayscale:
-            images = torch.cat((images[:,:,:,:,0],images[:,:,:,:,1],images[:,:,:,:,2]), 1)
-
-        # trim out superfluous top and bottom sections
-        images = images[:, :, img_crop_top:-img_crop_bottom, img_crop_sides:-img_crop_sides]  # origin is top left
-
-        # torch.set_printoptions(threshold=100000, linewidth=200, precision=2)
-        # np.set_printoptions(threshold=100000, linewidth=200, precision=2)
-        # print(images)
-
-        # x = F.relu(self.conv00(images))
-        # x = F.relu(self.conv0(x))
-        # x = F.relu(self.conv1(x))
+        # self.save_images(images)
 
         x = F.relu(self.conv1(images))
         x = F.relu(self.conv2(x))
@@ -412,6 +391,17 @@ class VanillaCNN(nn.Module):
 
         # And this gives us the output of our deep neural network :)
         return x
+
+    def save_images(self, images):
+        if self.img_archive is None:
+            self.img_archive = np.array(images.cpu()[0])
+        else:
+            self.img_archive = np.append(self.img_archive, images.cpu()[0], axis=0)
+        if len(self.img_archive) >= 100:
+            np.save("img_archive/{}x{}-{}-{}-{}.npy".format(img_height, img_width, img_grayscale,
+                                                            time.strftime("%Y%m%d-%H%M%S"), self.img_archive.sum()),
+                    self.img_archive)
+            self.img_archive = None
 
 
 # We can now implement the TMRL ActorModule interface that we are supposed to submit for this competition.
